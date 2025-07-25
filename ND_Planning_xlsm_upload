@@ -1,0 +1,148 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import folium
+from streamlit_folium import st_folium
+import math
+from datetime import timedelta, datetime
+
+# ตั้งค่า layout ให้เต็มหน้าจอ
+st.set_page_config(layout="wide")
+
+st.title("แผนที่และเส้นทางวิ่ง Rider") # เพิ่มชื่อหัวข้อเพื่อให้ดูดีขึ้น
+
+# --- ส่วนของการอัปโหลดไฟล์ ---
+uploaded_file = st.sidebar.file_uploader("อัปโหลดไฟล์ Excel (ND_Planning.xlsm)", type=["xlsm", "xlsx"])
+
+df = None # กำหนด df เป็น None เริ่มต้น
+
+if uploaded_file is not None:
+    try:
+        # อ่านไฟล์ที่อัปโหลด
+        df = pd.read_excel(uploaded_file, sheet_name="Data", engine="openpyxl")
+        st.success("อัปโหลดไฟล์และอ่านข้อมูลสำเร็จ!")
+
+    except Exception as e:
+        st.error(f"เกิดข้อผิดพลาดในการอ่านไฟล์ Excel: {e}")
+else:
+    st.info("กรุณาอัปโหลดไฟล์ Excel เพื่อเริ่มต้น")
+
+# --- ตรวจสอบว่า df มีข้อมูลหรือไม่ก่อนดำเนินการต่อ ---
+if df is not None:
+    # ----- ส่วนที่เหลือของโค้ด (เหมือนเดิมแต่ย้ายมาอยู่ในเงื่อนไข df is not None) -----
+
+    required_columns = ["Order ID", "LAT", "LON", "SLA STS", "Rider Name", "Time Check"]
+    missing_columns = [col for col in required_columns if col not in df.columns]
+    if missing_columns:
+        st.error(f"คอลัมน์ที่จำเป็นไม่ครบถ้วนในไฟล์ Excel: {', '.join(missing_columns)}")
+        st.stop()
+
+    merged_df = df.copy()
+    merged_df["LAT"] = pd.to_numeric(merged_df["LAT"], errors="coerce")
+    merged_df["LON"] = pd.to_numeric(merged_df["LON"], errors="coerce")
+    merged_df.dropna(subset=["LAT", "LON"], inplace=True)
+    merged_df["Time Check"] = merged_df["Time Check"].astype(str)
+    # เพิ่มการจัดการข้อมูล Rider Name ให้เป็น string และตัดช่องว่าง
+    merged_df["Rider Name"] = merged_df["Rider Name"].astype(str).str.strip()
+
+
+    # ค่าพิกัด MFC
+    center_lat = 13.737929161400837
+    center_lon = 100.63687556823479
+
+    # คำนวณ bearing แบบ vectorized
+    def fast_bearing(lat2, lon2):
+        dLon = np.radians(lon2 - center_lon)
+        lat1 = np.radians(center_lat)
+        lat2 = np.radians(lat2)
+        y = np.sin(dLon) * np.cos(lat2)
+        x = np.cos(lat1) * np.sin(lat2) - np.sin(lat1) * np.cos(lat2) * np.cos(dLon)
+        bearing = np.degrees(np.arctan2(y, x))
+        return (bearing + 360) % 360
+
+    merged_df["Bearing"] = fast_bearing(merged_df["LAT"], merged_df["LON"])
+
+    def assign_zone(bearing):
+        if 0 <= bearing < 90:
+            return "Zone 4"
+        elif 90 <= bearing < 180:
+            return "Zone 3"
+        elif 180 <= bearing < 270:
+            return "Zone 2"
+        else:
+            return "Zone 1"
+
+    merged_df["Zone"] = merged_df["Bearing"].apply(assign_zone)
+
+    # --- ✅ ส่วนของตัวเลือกการกรองที่แก้ไขและเพิ่มใหม่ ---
+    st.sidebar.header("ตัวเลือกการกรอง")
+
+    # สร้าง DataFrame เริ่มต้นสำหรับการกรอง
+    filtered_df = merged_df.copy()
+
+    # 1. ตัวกรอง Order ID
+    order_options = sorted(merged_df["Order ID"].unique())
+    selected_orders = st.sidebar.multiselect(
+        "เลือก Order ID:",
+        order_options,
+        default=st.session_state.get("selected_orders", [])
+    )
+    st.session_state["selected_orders"] = selected_orders
+    if selected_orders:
+        filtered_df = filtered_df[filtered_df["Order ID"].isin(selected_orders)]
+
+    # 2. (เพิ่มใหม่) ตัวกรอง Rider Name
+    rider_options = sorted(merged_df["Rider Name"].unique())
+    selected_riders = st.sidebar.multiselect(
+        "เลือก Rider Name:",
+        rider_options,
+        default=st.session_state.get("selected_riders", [])
+    )
+    st.session_state["selected_riders"] = selected_riders
+    if selected_riders:
+        filtered_df = filtered_df[filtered_df["Rider Name"].isin(selected_riders)]
+
+    # 3. ตัวกรอง Time Check
+    time_check_options = sorted(merged_df["Time Check"].unique())
+    selected_time_checks = st.sidebar.multiselect(
+        "เลือก Time Check:",
+        time_check_options,
+        default=st.session_state.get("selected_time_checks", [])
+    )
+    st.session_state["selected_time_checks"] = selected_time_checks
+    if selected_time_checks:
+        filtered_df = filtered_df[filtered_df["Time Check"].isin(selected_time_checks)]
+
+
+    filtered_df = filtered_df.sort_values(by="Order ID", ascending=True)
+
+    # --- ส่วนของการสร้างแผนที่และแสดงผล (เหมือนเดิม) ---
+    m = folium.Map(location=[center_lat, center_lon], zoom_start=13)
+    folium.Marker(location=[center_lat, center_lon], popup="📍MFC", icon=folium.Icon(color="green", icon="star")).add_to(m)
+    folium.Circle(location=[center_lat, center_lon], radius=7000, color='blue', opacity=0.4, fill=True, fill_color='red', fill_opacity=0.05, popup="รัศมี 7 กม.").add_to(m)
+
+    grouped = filtered_df.groupby(["LAT", "LON"]).agg(
+        order_ids=('Order ID', lambda x: ", ".join(sorted(set(map(str, x))))),
+        rider_names=('Rider Name', lambda x: ", ".join(sorted(set(map(str, x))))),
+        time_checks=('Time Check', lambda x: ", ".join(sorted(set(map(str, x))))),
+        zone=('Zone', 'first')
+    ).reset_index()
+
+    for idx, row in grouped.iterrows():
+        popup_text = f"Order: {row['order_ids']}<br>Rider: {row['rider_names']}<br>Time Check: {row['time_checks']}<br>Zone: {row['zone']}"
+        folium.Marker(location=[row["LAT"], row["LON"]], popup=popup_text, icon=folium.Icon(color="blue", icon="info-sign")).add_to(m)
+
+    zone_colors = { "Zone 1": "red", "Zone 2": "orange", "Zone 3": "purple", "Zone 4": "green" }
+    st.subheader("เส้นทางตาม Zone")
+    for zone, color in zone_colors.items():
+        zone_points_df = filtered_df[filtered_df["Zone"] == zone]
+        if not zone_points_df.empty:
+            route_points = [[center_lat, center_lon]] + zone_points_df[["LAT", "LON"]].values.tolist()
+            folium.PolyLine(route_points, color=color, weight=2.5, opacity=0.8, popup=zone).add_to(m)
+        else:
+            st.info(f"ไม่มีข้อมูล Order สำหรับ {zone} ในตัวเลือกที่กรอง")
+
+    st_folium(m, width="100%", height=1000)
+    st.subheader("ข้อมูล Order ที่เลือก")
+    columns_to_display = ["Order ID", "Rider Name", "SLA STS", "Time Check", "Zone"]
+    st.dataframe(filtered_df[columns_to_display], use_container_width=True)
